@@ -71,7 +71,7 @@ export const PRESET_COMMENTS: Record<string, CommentItem[]> = {
       id: 'c103',
       authorName: 'Marcus_V',
       authorProfileImage: 'https://images.unsplash.com/photo-1570295999919-56ceb5ecca61?w=100&auto=format&fit=crop&q=80',
-      text: 'Can you please do a follow-up video showing how to handle authentication and user sessions with Supabase or Firebase?',
+      text: 'Can you please do a follow-up video showing how to handle authentication and user sessions with a secure backend provider?',
       likeCount: 305,
       publishedAt: '2026-06-12T17:45:00Z',
       sentiment: 'neutral',

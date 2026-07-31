@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
+import { randomUUID } from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import Stripe from 'stripe';
@@ -38,6 +39,106 @@ if (!process.env.YOUTUBE_API_KEY) {
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const oauthSessionStore = new Map<string, { accessToken: string; refreshToken?: string; expiresAt: number }>();
+const subscriptionStore = new Map<string, { plan: string; status: string; expiresAt?: number; updatedAt: number }>();
+
+function issueOAuthSessionToken(accessToken: string, refreshToken?: string): string {
+  const sessionToken = randomUUID();
+  oauthSessionStore.set(sessionToken, {
+    accessToken,
+    refreshToken,
+    expiresAt: Date.now() + 1000 * 60 * 60
+  });
+  return sessionToken;
+}
+
+function resolveOAuthAccessToken(input?: string): string | undefined {
+  if (!input) return undefined;
+
+  const cached = oauthSessionStore.get(input);
+  if (cached) {
+    if (cached.expiresAt <= Date.now()) {
+      oauthSessionStore.delete(input);
+      return undefined;
+    }
+    return cached.accessToken;
+  }
+
+  return input;
+}
+
+function isProAccessGranted(userEmail?: string, sessionToken?: string): boolean {
+  if (userEmail && subscriptionStore.has(userEmail.toLowerCase())) {
+    const record = subscriptionStore.get(userEmail.toLowerCase());
+    if (record && (record.status === 'paid' || record.status === 'active')) {
+      if (record.expiresAt && record.expiresAt <= Date.now()) {
+        subscriptionStore.delete(userEmail.toLowerCase());
+        return false;
+      }
+      return true;
+    }
+  }
+
+  if (sessionToken) {
+    const tokenRecord = oauthSessionStore.get(sessionToken);
+    if (tokenRecord && tokenRecord.expiresAt > Date.now()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function setSubscriptionForUser(userEmail: string, plan: string, status: string, expiresAt?: number) {
+  if (!userEmail) return;
+  subscriptionStore.set(userEmail.toLowerCase(), {
+    plan,
+    status,
+    expiresAt,
+    updatedAt: Date.now()
+  });
+}
+
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const stripe = getStripe();
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!stripe) {
+    return res.status(500).json({ error: 'Stripe is not configured' });
+  }
+
+  if (!webhookSecret) {
+    return res.status(500).json({ error: 'STRIPE_WEBHOOK_SECRET is not configured' });
+  }
+
+  const signature = req.headers['stripe-signature'];
+  if (!signature || typeof signature !== 'string') {
+    return res.status(400).json({ error: 'Missing Stripe signature' });
+  }
+
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object as any;
+      const email = session.customer_details?.email || session.customer_email || session.metadata?.email;
+      if (email) {
+        setSubscriptionForUser(email, 'Creator Pro', 'paid', Date.now() + 1000 * 60 * 60 * 24 * 30);
+      }
+    } else if (event.type === 'invoice.paid') {
+      const invoice = event.data.object as any;
+      const email = invoice.customer_email || invoice.customer?.email || invoice.metadata?.email;
+      if (email) {
+        setSubscriptionForUser(email, 'Creator Pro', 'paid', Date.now() + 1000 * 60 * 60 * 24 * 30);
+      }
+    }
+
+    return res.json({ received: true });
+  } catch (err: any) {
+    console.error('Stripe webhook verification failed:', err.message);
+    return res.status(400).json({ error: `Webhook Error: ${err.message}` });
+  }
+});
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -189,86 +290,106 @@ app.get('/api/auth/google/callback', async (req, res) => {
     }
   }
 
-  // Resilient fallback profile for Khalid Mokher to prevent 403 access_denied screens
-  const fallbackUserPayload = {
-    id: 'usr_khalid_101',
-    name: 'Khalid Mokher',
-    email: 'khalidmokher@gmail.com',
-    avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-    plan: 'Creator Pro'
-  };
+  if (!code || error) {
+    return res.redirect('/?auth_error=1');
+  }
 
-  let userPayload: any = fallbackUserPayload;
+  let userPayload: any = null;
 
-  if (code && !error) {
+  try {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      throw new Error('Google OAuth credentials are not configured');
+    }
+
+    // Exchange authorization code for tokens
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code'
+      })
+    });
+
+    const tokenData = await tokenRes.json();
+
+    if (!tokenRes.ok || !tokenData.access_token) {
+      throw new Error(tokenData.error_description || tokenData.error || 'Failed to exchange Google authorization code');
+    }
+
+    // Fetch user profile from Google UserInfo endpoint
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+
+    if (!userRes.ok) {
+      throw new Error(`Google profile fetch failed with status ${userRes.status}`);
+    }
+
+    const profile = await userRes.json();
+    const sessionToken = issueOAuthSessionToken(tokenData.access_token, tokenData.refresh_token);
+    const email = profile.email || '';
+    if (email) {
+      setSubscriptionForUser(email, 'Creator Pro', 'active', Date.now() + 1000 * 60 * 60 * 24 * 7);
+    }
+    userPayload = {
+      id: profile.id || `g_${Date.now()}`,
+      name: profile.name || profile.given_name || profile.email?.split('@')[0] || 'Google user',
+      email,
+      avatarUrl: profile.picture,
+      plan: 'Creator Pro',
+      accessToken: sessionToken,
+      sessionToken
+    };
+
+    // Fetch user's connected YouTube channel if accessible
     try {
-      const clientId = process.env.GOOGLE_CLIENT_ID;
-      const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-
-      if (clientId && clientSecret) {
-        // Exchange authorization code for tokens
-        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            code,
-            client_id: clientId,
-            client_secret: clientSecret,
-            redirect_uri: redirectUri,
-            grant_type: 'authorization_code'
-          })
-        });
-
-        const tokenData = await tokenRes.json();
-
-        if (tokenData.access_token) {
-          // Fetch user profile from Google UserInfo endpoint
-          const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-            headers: { Authorization: `Bearer ${tokenData.access_token}` }
-          });
-
-          if (userRes.ok) {
-            const profile = await userRes.json();
-            userPayload = {
-              id: profile.id || `g_${Date.now()}`,
-              name: profile.name || profile.given_name || profile.email?.split('@')[0] || 'Khalid Mokher',
-              email: profile.email || 'khalidmokher@gmail.com',
-              avatarUrl: profile.picture || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-              plan: 'Creator Pro',
-              accessToken: tokenData.access_token,
-              refreshToken: tokenData.refresh_token
-            };
-
-            // Fetch user's connected YouTube channel if accessible
-            try {
-              const channelRes = await fetch('https://www.googleapis.com/youtube/v3/channels?mine=true&part=snippet,contentDetails,statistics', {
-                headers: { Authorization: `Bearer ${tokenData.access_token}` }
-              });
-              if (channelRes.ok) {
-                const channelData = await channelRes.json();
-                if (channelData.items && channelData.items.length > 0) {
-                  const ch = channelData.items[0];
-                  userPayload.channelInfo = {
-                    id: ch.id,
-                    title: ch.snippet.title,
-                    description: ch.snippet.description,
-                    customUrl: ch.snippet.customUrl ? (ch.snippet.customUrl.startsWith('@') ? ch.snippet.customUrl : `@${ch.snippet.customUrl}`) : '@MyChannel',
-                    avatarUrl: ch.snippet.thumbnails?.high?.url || ch.snippet.thumbnails?.medium?.url,
-                    subscriberCount: ch.statistics?.subscriberCount ? parseInt(ch.statistics.subscriberCount, 10) : 0,
-                    videoCount: ch.statistics?.videoCount ? parseInt(ch.statistics.videoCount, 10) : 0
-                  };
-                }
-              }
-            } catch (ytErr) {
-              console.warn('Could not fetch YouTube channel during callback:', ytErr);
-            }
-          }
+      const channelRes = await fetch('https://www.googleapis.com/youtube/v3/channels?mine=true&part=snippet,contentDetails,statistics', {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` }
+      });
+      if (channelRes.ok) {
+        const channelData = await channelRes.json();
+        if (channelData.items && channelData.items.length > 0) {
+          const ch = channelData.items[0];
+          userPayload.channelInfo = {
+            id: ch.id,
+            title: ch.snippet.title,
+            description: ch.snippet.description,
+            customUrl: ch.snippet.customUrl ? (ch.snippet.customUrl.startsWith('@') ? ch.snippet.customUrl : `@${ch.snippet.customUrl}`) : '@MyChannel',
+            avatarUrl: ch.snippet.thumbnails?.high?.url || ch.snippet.thumbnails?.medium?.url,
+            subscriberCount: ch.statistics?.subscriberCount ? parseInt(ch.statistics.subscriberCount, 10) : 0,
+            videoCount: ch.statistics?.videoCount ? parseInt(ch.statistics.videoCount, 10) : 0
+          };
         }
       }
-    } catch (err) {
-      console.warn('OAuth token exchange error, using resilient profile fallback:', err);
+    } catch (ytErr) {
+      console.warn('Could not fetch YouTube channel during callback:', ytErr);
     }
+  } catch (err) {
+    console.warn('OAuth callback failed:', err);
+    return res.redirect('/?auth_error=1');
   }
+
+  if (!userPayload) {
+    return res.redirect('/?auth_error=1');
+  }
+
+  const frontendOrigin = (process.env.APP_URL?.trim() || getAppUrl(req) || 'https://www.zencutstudio.com').replace(/\/$/, '');
+  const safeUserPayload = userPayload ? {
+    id: userPayload.id,
+    name: userPayload.name,
+    email: userPayload.email,
+    avatarUrl: userPayload.avatarUrl,
+    plan: userPayload.plan,
+    accessToken: userPayload.accessToken,
+    sessionToken: userPayload.sessionToken
+  } : null;
 
   return res.send(`
     <!DOCTYPE html>
@@ -283,9 +404,10 @@ app.get('/api/auth/google/callback', async (req, res) => {
           <p style="color: #94a3b8; font-size: 0.875rem; margin-top: 0.25rem;">Successfully authenticated with Google. Redirecting to Studio...</p>
         </div>
         <script>
-          const user = ${JSON.stringify(userPayload)};
+          const user = ${JSON.stringify(safeUserPayload)};
+          const frontendOrigin = ${JSON.stringify(frontendOrigin)};
           if (window.opener) {
-            window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS', user }, '*');
+            window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS', user }, frontendOrigin);
             setTimeout(() => window.close(), 300);
           } else {
             localStorage.setItem('yt_studio_user', JSON.stringify(user));
@@ -315,13 +437,15 @@ app.post('/api/auth/google/verify-token', async (req, res) => {
 
     const profile = await userRes.json();
 
+    const sessionToken = issueOAuthSessionToken(accessToken);
     const userPayload = {
       id: profile.id || `g_${Date.now()}`,
       name: profile.name || profile.given_name || 'Google Creator',
       email: profile.email,
       avatarUrl: profile.picture,
       plan: 'Creator Pro',
-      accessToken
+      accessToken: sessionToken,
+      sessionToken
     };
 
     return res.json({ user: userPayload });
@@ -456,11 +580,13 @@ app.post('/api/youtube/search-channels', async (req, res) => {
       parsedChannelId = rawQuery;
     }
 
+    const resolvedAccessToken = resolveOAuthAccessToken(accessToken);
+
     // 1. If OAuth accessToken is provided, try listing user's owned channels
-    if (accessToken) {
+    if (resolvedAccessToken) {
       try {
         const mineRes = await fetch('https://www.googleapis.com/youtube/v3/channels?mine=true&part=snippet,contentDetails,statistics', {
-          headers: { Authorization: `Bearer ${accessToken}` }
+          headers: { Authorization: `Bearer ${resolvedAccessToken}` }
         });
         if (mineRes.ok) {
           const mineData = await mineRes.json();
@@ -632,11 +758,13 @@ app.post('/api/youtube/channel-videos', async (req, res) => {
     let fetchedChannel: any = null;
     let videos: any[] = [];
 
+    const resolvedAccessToken = resolveOAuthAccessToken(accessToken);
+
     // 1. If OAuth accessToken is provided, fetch authenticated user's channel & uploads
-    if (accessToken) {
+    if (resolvedAccessToken) {
       try {
         const channelRes = await fetch('https://www.googleapis.com/youtube/v3/channels?mine=true&part=snippet,contentDetails,statistics', {
-          headers: { Authorization: `Bearer ${accessToken}` }
+          headers: { Authorization: `Bearer ${resolvedAccessToken}` }
         });
         
         if (channelRes.ok) {
@@ -665,7 +793,7 @@ app.post('/api/youtube/channel-videos', async (req, res) => {
                 : `https://www.googleapis.com/youtube/v3/playlistItems?playlistId=${uploadsPlaylist}&part=snippet,contentDetails&maxResults=50`;
               
               const playlistRes = await fetch(playlistUrl, {
-                headers: key ? {} : { Authorization: `Bearer ${accessToken}` }
+                headers: key ? {} : { Authorization: `Bearer ${resolvedAccessToken}` }
               });
 
               if (playlistRes.ok) {
@@ -679,7 +807,7 @@ app.post('/api/youtube/channel-videos', async (req, res) => {
                       : `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics,contentDetails&id=${videoIds.join(',')}`;
 
                     const statsRes = await fetch(statsUrl, {
-                      headers: key ? {} : { Authorization: `Bearer ${accessToken}` }
+                      headers: key ? {} : { Authorization: `Bearer ${resolvedAccessToken}` }
                     });
 
                     if (statsRes.ok) {
@@ -839,8 +967,14 @@ app.post('/api/youtube/channel-videos', async (req, res) => {
 app.post('/api/youtube/comments', async (req, res) => {
   try {
     const { videoId, maxResults = 100, apiKey } = req.body;
+    const userEmail = req.headers['x-user-email'] as string | undefined;
+    const sessionToken = req.headers['x-session-token'] as string | undefined;
     if (!videoId) {
       return res.status(400).json({ error: 'videoId is required' });
+    }
+
+    if (!isProAccessGranted(userEmail, sessionToken)) {
+      return res.status(403).json({ error: 'Pro access required' });
     }
 
     const key = apiKey || process.env.YOUTUBE_API_KEY;
@@ -895,8 +1029,14 @@ app.post('/api/youtube/comments', async (req, res) => {
 app.post('/api/ai/summary', async (req, res) => {
   try {
     const { videoTitle, comments, settings } = req.body;
+    const userEmail = req.headers['x-user-email'] as string | undefined;
+    const sessionToken = req.headers['x-session-token'] as string | undefined;
     if (!comments || !Array.isArray(comments) || comments.length === 0) {
       return res.status(400).json({ error: 'No comments provided for analysis' });
+    }
+
+    if (!isProAccessGranted(userEmail, sessionToken)) {
+      return res.status(403).json({ error: 'Pro access required' });
     }
 
     const commentTexts = comments.map((c: any, i: number) => `[Comment #${i+1} by ${c.authorName} (${c.likeCount} likes)]: ${c.text}`).join('\n');
@@ -1069,8 +1209,14 @@ Generate a comprehensive JSON analysis matching this exact structure:
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { videoTitle, question, comments, history, settings } = req.body;
+    const userEmail = req.headers['x-user-email'] as string | undefined;
+    const sessionToken = req.headers['x-session-token'] as string | undefined;
     if (!question) {
       return res.status(400).json({ error: 'Question is required' });
+    }
+
+    if (!isProAccessGranted(userEmail, sessionToken)) {
+      return res.status(403).json({ error: 'Pro access required' });
     }
 
     // 0-Comments Guard: If video has no comments, return early with clear explanation
@@ -1378,6 +1524,7 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
 app.get('/api/stripe/verify-session', async (req, res) => {
   try {
     const { sessionId } = req.query;
+    const userEmail = req.headers['x-user-email'] as string | undefined;
     if (!sessionId || typeof sessionId !== 'string') {
       return res.status(400).json({ error: 'Missing session_id parameter' });
     }
@@ -1388,8 +1535,15 @@ app.get('/api/stripe/verify-session', async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const verified = session.payment_status === 'paid';
+    if (verified && session.customer_details?.email) {
+      setSubscriptionForUser(session.customer_details.email, 'Creator Pro', 'paid', Date.now() + 1000 * 60 * 60 * 24 * 30);
+    }
+    if (userEmail && verified) {
+      setSubscriptionForUser(userEmail, 'Creator Pro', 'paid', Date.now() + 1000 * 60 * 60 * 24 * 30);
+    }
     return res.json({
-      verified: session.payment_status === 'paid',
+      verified,
       status: session.status,
       customerEmail: session.customer_details?.email,
     });
