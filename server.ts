@@ -32,14 +32,12 @@ function getOAuthRedirectUri(req: express.Request): string {
   return `${getAppUrl(req)}/api/auth/google/callback`;
 }
 
-// Default YouTube Data API v3 Key
-const DEFAULT_YOUTUBE_API_KEY = 'AIzaSyACsl1vJh23gkmY4pwiCsbjqeVLSL63DKE';
 if (!process.env.YOUTUBE_API_KEY) {
-  process.env.YOUTUBE_API_KEY = DEFAULT_YOUTUBE_API_KEY;
+  console.warn('⚠️ YOUTUBE_API_KEY not set');
 }
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -1423,4 +1421,8 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1') {
+  startServer();
+}
+
+export default app;
