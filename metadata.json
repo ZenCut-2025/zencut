@@ -1,0 +1,6 @@
+{
+  "name": "Zencut Studio",
+  "description": "Analyze YouTube video comments with AI summaries, sentiment analytics, and interactive grounded Q&A chat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
